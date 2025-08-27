@@ -1,0 +1,118 @@
+// ================== MODIS EVI (CAT only, QA + scaling + CSV) ==================
+
+// 0) AOI → geometry (works for Geometry/Feature/FeatureCollection)
+if (typeof CAT === 'undefined') {
+  throw 'Draw/import a polygon named CAT in the left panel.';
+}
+var catGeom = (CAT.geometry) ? CAT.geometry() : ee.Geometry(CAT);
+print('CAT area (km²):', catGeom.area().divide(1e6));
+
+// 1) Parameters
+var START = '2000-02-18';   // MOD13Q1 v6.1 start
+var END   = '2024-12-31';
+var N_SAMPLES = 300;        // number of sample points for this test (tune later)
+
+// 2) Load MOD13Q1, filter, QA, and scale EVI
+var modisCol = ee.ImageCollection("MODIS/061/MOD13Q1")
+  .filterBounds(catGeom)
+  .filterDate(START, END)
+  .map(function(img){
+    // Keep Good (0) and Marginal (1)
+    var qa = img.select('SummaryQA');
+    var keep = qa.lte(1);
+
+    // Scale EVI to real values
+    var evi = img.select('EVI').multiply(0.0001).rename('EVI');
+
+    // Return masked EVI image, preserving metadata (date, etc.)
+    return ee.Image().addBands(evi).updateMask(keep)
+             .copyProperties(img, img.propertyNames());
+  });
+
+print('MODIS images after filter:', modisCol.size());
+
+// 3) Build sample points inside CAT
+//    We use the MODIS projection so sampling is consistent at 250 m
+var modisRef = modisCol.first();
+var randImg = ee.Image.random(42);  // deterministic seed
+var pts = randImg.addBands(ee.Image.pixelLonLat())
+  .sample({
+    region: catGeom,
+    scale: 250,           // MODIS 250 m
+    numPixels: 5000,      // generate a pool, then we take top N_SAMPLES
+    geometries: true,
+    tileScale: 2
+  })
+  .sort('random')
+  .limit(N_SAMPLES);
+
+print('Sample points:', pts.size());
+
+// 4) Extract EVI time series at sample points
+function sampleEVI(img){
+  var dateStr = img.date().format('YYYY-MM-dd');
+  var s = img.select('EVI').sampleRegions({
+    collection: pts,
+    scale: 250,
+    geometries: true
+  }).map(function(f){ return f.set('date', dateStr); });
+  return s;
+}
+
+var tsLong = ee.FeatureCollection(modisCol.map(sampleEVI)).flatten()
+  .filter(ee.Filter.notNull(['EVI']));
+
+print('Rows in long table:', tsLong.size());
+
+// 5) Quick map layers (optional)
+//    Use fixed numbers for visualization to avoid client/server encoding issues
+// Map.centerObject(catGeom, 9);
+// var eviMedian = modisCol.select('EVI').median();
+// Map.addLayer(eviMedian, {min: 0.1, max: 0.6}, 'Median EVI (2000–2024)');
+// Map.addLayer(pts, {color: 'cyan'}, 'Sample points');
+
+//5)
+// --- 5) Map preview (CAT-only, proper EVI palette) ---
+
+// Median EVI over time, clipped to CAT so it renders only in your ROI
+var eviMedianCAT = modisCol.select('EVI').median().clip(catGeom);
+
+// Use percentiles within CAT to set a sensible stretch
+var eviStats = eviMedianCAT.reduceRegion({
+  reducer: ee.Reducer.percentile([5, 95]),
+  geometry: catGeom,
+  scale: 250,
+  bestEffort: true,
+  tileScale: 2,
+  maxPixels: 1e9
+});
+var vmin = ee.Number(eviStats.get('EVI_p5')).getInfo();   // client numbers for viz
+var vmax = ee.Number(eviStats.get('EVI_p95')).getInfo();
+
+// Vegetation-friendly green palette (low -> high EVI)
+var eviPalette = [
+  '#f7fcf5','#e5f5e0','#c7e9c0','#a1d99b',
+  '#74c476','#41ab5d','#238b45','#006d2c','#00441b'
+];
+
+// Center on CAT and add the clipped EVI layer
+Map.centerObject(catGeom, 9);
+Map.addLayer(eviMedianCAT, {min: vmin, max: vmax, palette: eviPalette}, 'Median EVI (CAT only)');
+
+// (Optional) Show your sample points on top
+Map.addLayer(pts, {color: 'cyan'}, 'Sample points');
+
+
+// 6) Export to Google Drive as CSV
+Export.table.toDrive({
+  collection: tsLong,
+  description: 'CAT_MODIS_EVI_TimeSeries_Samples',
+  fileFormat: 'CSV'
+});
+
+// ---------- Notes ----------
+// • The CSV will be "long": each row is (point, date, EVI).
+// • Columns include geometry (lon/lat), 'date', and 'EVI'.
+// • Later, we’ll attach elev_band and/or purity flags upstream before export.
+// • When ready for full coverage, we can switch from random points to a complete
+//   grid of pixel centers inside CAT and export (heavier files).
