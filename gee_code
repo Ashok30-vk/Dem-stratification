@@ -1,0 +1,107 @@
+// ================== CAT Elevation Stratification (Low/Mid/High) ==================
+// This script:
+//  1) Normalizes CAT to a geometry
+//  2) Computes 33rd/67th percentiles of SRTM within CAT
+//  3) Classifies 30 m DEM to 3 bands (1=Low, 2=Mid, 3=High)
+//  4) Displays layers with proper client-side numbers
+//  5) Prints counts per band
+//  6) (Optional) Exports the 30 m band raster
+//  7) (Optional) Shows how to downscale to the MODIS 250 m grid by majority
+
+// --------------------- 0) AOI as geometry ---------------------
+if (typeof CAT === 'undefined') {
+  throw 'Draw/import a polygon named CAT in the left panel.';
+}
+// Works if CAT is a Geometry, Feature, or FeatureCollection:
+var catGeom = (CAT.geometry) ? CAT.geometry() : ee.Geometry(CAT);
+print('CAT area (km²):', catGeom.area().divide(1e6));
+
+// --------------------- 1) Load SRTM & clip ---------------------
+var srtm = ee.Image('USGS/SRTMGL1_003');
+var elevCAT = srtm.clip(catGeom);
+
+// --------------------- 2) Percentiles (33 & 67) ---------------------
+// Use integers so keys are 'elevation_p33' and 'elevation_p67'
+var qs = elevCAT.reduceRegion({
+  reducer: ee.Reducer.percentile([33, 67]),
+  geometry: catGeom,
+  scale: 30,
+  bestEffort: true,
+  tileScale: 2,
+  maxPixels: 1e10
+});
+print('Raw percentile dict:', qs);
+
+var q1 = ee.Number(qs.get('elevation_p33'));
+var q2 = ee.Number(qs.get('elevation_p67'));
+print('CAT elevation cutpoints (m): q1 =', q1, ', q2 =', q2);
+
+// --------------------- 3) Classify to 3 bands (30 m) ---------------------
+var band30 = elevCAT
+  .where(elevCAT.lte(q1), 1)
+  .where(elevCAT.gt(q1).and(elevCAT.lte(q2)), 2)
+  .where(elevCAT.gt(q2), 3)
+  .rename('elev_band')
+  .toInt8()
+  .clip(catGeom);
+
+// --------------------- 4) Map view with client-side numbers ---------------------
+// Build visualization min/max from DEM min/max to avoid server->client encoding issues
+var minmax = elevCAT.reduceRegion({
+  reducer: ee.Reducer.minMax(),
+  geometry: catGeom,
+  scale: 90,
+  bestEffort: true,
+  tileScale: 2,
+  maxPixels: 1e9
+});
+var visMin = ee.Number(minmax.get('elevation_min')).getInfo();
+var visMax = ee.Number(minmax.get('elevation_max')).getInfo();
+
+// Center and add layers
+Map.centerObject(catGeom, 10);
+Map.addLayer(elevCAT, {min: visMin, max: visMax, palette: ['#f7fbff','#6baed6','#08306b']}, 'CAT elevation (m)');
+Map.addLayer(band30, {min: 1, max: 3, palette: ['#9ecae1','#6baed6','#2171b5']}, 'CAT stratification bands (30 m)');
+
+// --------------------- 5) Band counts (sanity check) ---------------------
+var hist = band30.reduceRegion({
+  reducer: ee.Reducer.frequencyHistogram(),
+  geometry: catGeom,
+  scale: 30,
+  bestEffort: true,
+  tileScale: 2,
+  maxPixels: 1e10
+});
+print('Counts per band (30 m):', hist);
+
+// --------------------- 6) Optional: export the 30 m band raster ---------------------
+
+Export.image.toDrive({
+  image: band30,
+  description: 'CAT_elev_bands_30m',
+  region: catGeom,
+  scale: 30,
+  maxPixels: 1e13
+});
+
+// --------------------- 7) Optional: MODIS 250 m majority band ---------------------
+// This is handy later when attaching elev_band directly to MODIS time series.
+// (Uncomment to create a 250 m band raster aligned to MODIS grid.)
+//
+// var modisRef = ee.ImageCollection('MODIS/061/MOD13Q1')
+//                   .filterDate('2020-01-01', '2020-12-31')
+//                   .first(); // for 250 m projection
+//
+// var band250 = band30
+//   .reduceResolution({ reducer: ee.Reducer.mode(), maxPixels: 4096 })
+//   .reproject({ crs: modisRef.projection() })
+//   .rename('elev_band_250m');
+//
+// Map.addLayer(band250, {min: 1, max: 3, palette: ['#9ecae1','#6baed6','#2171b5']}, 'CAT elev bands (250 m)');
+// Export.image.toDrive({
+//   image: band250,
+//   description: 'CAT_elev_bands_250m_MODISgrid',
+//   region: catGeom,
+//   scale: 250,
+//   maxPixels: 1e13
+// });
