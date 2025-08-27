@@ -1,0 +1,195 @@
+// ================== CAT — Elevation Bands + MODIS EVI + Exports ==================
+// What you get:
+//  • elev_band (1=Low, 2=Mid, 3=High) from SRTM (CAT-specific quantiles)
+//  • MOD13Q1 EVI (QA-masked, scaled)
+//  • CSV #1: point time-series with elev_band
+//  • CSV #2: per-date × band summary (mean/median EVI, counts)
+
+// --------------------- 0) AOI → geometry ---------------------
+if (typeof CAT === 'undefined') {
+  throw 'Draw/import a polygon named CAT in the left panel.';
+}
+// Works for Geometry / Feature / FeatureCollection:
+var catGeom = (CAT.geometry) ? CAT.geometry() : ee.Geometry(CAT);
+print('CAT area (km²):', catGeom.area().divide(1e6));
+
+// --------------------- 1) Parameters ---------------------
+var START = '2000-02-18';     // MOD13Q1 v6.1 start
+var END   = '2024-12-31';
+var N_SAMPLES = 300;          // points for CSV #1
+
+// Toggles (set true/false as you like)
+var DO_POINTS_EXPORT = true;  // CSV #1
+var DO_BAND_TS_EXPORT = true; // CSV #2
+
+// --------------------- 2) Elevation bands (SRTM → 30 m → 250 m majority) ---------------------
+var srtm = ee.Image('USGS/SRTMGL1_003').clip(catGeom);
+
+// Percentiles: use integers so keys are elevation_p33 / p67
+var qs = srtm.reduceRegion({
+  reducer: ee.Reducer.percentile([33, 67]),
+  geometry: catGeom,
+  scale: 30,
+  bestEffort: true,
+  tileScale: 2,
+  maxPixels: 1e10
+});
+print('SRTM percentile dict:', qs);
+var q1 = ee.Number(qs.get('elevation_p33'));
+var q2 = ee.Number(qs.get('elevation_p67'));
+print('CAT cutpoints (m): q1 =', q1, ', q2 =', q2);
+
+// 30 m classification: 1=Low (<=q1), 2=Mid (q1..q2], 3=High (>q2)
+var band30 = srtm
+  .where(srtm.lte(q1), 1)
+  .where(srtm.gt(q1).and(srtm.lte(q2)), 2)
+  .where(srtm.gt(q2), 3)
+  .rename('elev_band')
+  .toInt8()
+  .clip(catGeom);
+
+// Majority to MODIS 250 m grid
+var modisRef = ee.ImageCollection('MODIS/061/MOD13Q1')
+                  .filterDate('2020-01-01', '2020-12-31')
+                  .first(); // for 250 m projection
+
+var band250 = band30
+  .reduceResolution({ reducer: ee.Reducer.mode(), maxPixels: 4096 })
+  .reproject({ crs: modisRef.projection() })
+  .rename('elev_band');
+
+// Band counts at 250 m (sanity)
+var hist250 = band250.reduceRegion({
+  reducer: ee.Reducer.frequencyHistogram(),
+  geometry: catGeom,
+  scale: 250,
+  bestEffort: true,
+  tileScale: 2,
+  maxPixels: 1e10
+});
+print('Counts per band (250 m):', hist250);
+
+// --------------------- 3) MODIS EVI (QA + scaling) ---------------------
+var modisCol = ee.ImageCollection('MODIS/061/MOD13Q1')
+  .filterBounds(catGeom)
+  .filterDate(START, END)
+  .map(function(img){
+    var qa = img.select('SummaryQA'); // 0=Good,1=Marginal,2=Snow,3=Cloud
+    var keep = qa.lte(1);
+    var evi = img.select('EVI').multiply(0.0001).rename('EVI');
+    return ee.Image().addBands(evi).updateMask(keep)
+             .copyProperties(img, img.propertyNames());
+  });
+print('MODIS images after QA filter:', modisCol.size());
+
+// For convenience later, add the elev_band as a band to each MODIS image
+var modisWithBand = modisCol.map(function(img){
+  return img.addBands(band250); // bands: EVI, elev_band
+});
+
+// --------------------- 4) Map preview (CAT-only EVI, proper palette) ---------------------
+var eviMedianCAT = modisCol.select('EVI').median().clip(catGeom);
+var eviStats = eviMedianCAT.reduceRegion({
+  reducer: ee.Reducer.percentile([5, 95]),
+  geometry: catGeom,
+  scale: 250,
+  bestEffort: true,
+  tileScale: 2,
+  maxPixels: 1e9
+});
+var vmin = ee.Number(eviStats.get('EVI_p5')).getInfo();
+var vmax = ee.Number(eviStats.get('EVI_p95')).getInfo();
+
+var eviPalette = [
+  '#f7fcf5','#e5f5e0','#c7e9c0','#a1d99b',
+  '#74c476','#41ab5d','#238b45','#006d2c','#00441b'
+];
+
+Map.centerObject(catGeom, 9);
+Map.addLayer(eviMedianCAT, {min: vmin, max: vmax, palette: eviPalette}, 'Median EVI (CAT only)');
+Map.addLayer(band250, {min: 1, max: 3, palette: ['#9ecae1','#6baed6','#2171b5']}, 'Elev bands (250 m)');
+
+// --------------------- 5) CSV #1 — Point time-series with elev_band ---------------------
+if (DO_POINTS_EXPORT) {
+  // Deterministic random points at 250 m
+  var pts = ee.Image.random(42).addBands(ee.Image.pixelLonLat())
+    .sample({
+      region: catGeom,
+      scale: 250,
+      numPixels: 5000,
+      geometries: true,
+      tileScale: 2
+    })
+    .sort('random')
+    .limit(N_SAMPLES)
+    .map(function(f){ return f.set({'island':'CAT'}); });
+
+  // Sample both EVI and elev_band at the points for each date
+  function sampleEVIwithBand(img){
+    var dateStr = img.date().format('YYYY-MM-dd');
+    return img.select(['EVI','elev_band']).sampleRegions({
+      collection: pts, scale: 250, geometries: true
+    }).map(function(f){ return f.set('date', dateStr); });
+  }
+
+  var tsPts = ee.FeatureCollection(modisWithBand.map(sampleEVIwithBand))
+                .flatten()
+                .filter(ee.Filter.notNull(['EVI','elev_band']));
+  print('Rows (points × dates):', tsPts.size());
+
+  Export.table.toDrive({
+    collection: tsPts,
+    description: 'CAT_EVI_points_with_elevBand',
+    fileFormat: 'CSV'
+  });
+
+  // Optional map overlay
+  Map.addLayer(pts, {color: 'cyan'}, 'Sample points');
+}
+
+// --------------------- 6) CSV #2 — Per-date × band summary ---------------------
+if (DO_BAND_TS_EXPORT) {
+  function bandStats(img){
+    var dateStr = img.date().format('YYYY-MM-dd');
+
+    // 2-band image: [EVI, elev_band] for grouped reduction
+    var im = img.select('EVI').addBands(band250);
+
+    var grouped = im.reduceRegion({
+      reducer: ee.Reducer.mean()
+                 .combine({reducer2: ee.Reducer.median(), sharedInputs: true})
+                 .combine({reducer2: ee.Reducer.count(),  sharedInputs: true})
+                 .group({groupField: 1, groupName: 'elev_band'}),
+      geometry: catGeom,
+      scale: 250,
+      bestEffort: true,
+      tileScale: 4,
+      maxPixels: 1e10
+    });
+
+    var groups = ee.List(grouped.get('groups'));
+    var feats = groups.map(function(d){
+      d = ee.Dictionary(d);
+      return ee.Feature(null, {
+        date: dateStr,
+        elev_band: d.get('elev_band'),
+        EVI_mean: d.get('mean'),
+        EVI_median: d.get('median'),
+        n: d.get('count')  // number of 250 m pixels contributing that date
+      });
+    });
+
+    return ee.FeatureCollection(feats);
+  }
+
+  var tsBand = ee.FeatureCollection(modisWithBand.map(bandStats)).flatten();
+  print('Rows (dates × bands):', tsBand.size());
+
+  Export.table.toDrive({
+    collection: tsBand,
+    description: 'CAT_EVI_timeseries_by_elevBand',
+    fileFormat: 'CSV'
+  });
+}
+
+// ================== End ==================
